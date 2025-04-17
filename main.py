@@ -42,9 +42,16 @@ def run_depth_estimation(midas, transform, image, device):
         ).squeeze()
     depth_map = prediction.cpu().numpy()
     depth_map = cv2.medianBlur(depth_map.astype(np.float32), 5)  # Smooth depth map
+    
+    # Normalize depth map for better visualization
+    depth_min = np.percentile(depth_map, 5)
+    depth_max = np.percentile(depth_map, 95)
+    depth_map = np.clip(depth_map, depth_min, depth_max)
+    depth_map = (depth_map - depth_min) / (depth_max - depth_min)
+    
     return depth_map
 
-def run_object_detection(model, frame, depth_map):
+def run_object_detection(model, frame):
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = model(rgb)
     detections = results.pandas().xyxy[0]
@@ -56,13 +63,6 @@ def run_object_detection(model, frame, depth_map):
         conf = row['confidence']
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
         
-        # Extract depth information
-        if 0 <= cx < depth_map.shape[1] and 0 <= cy < depth_map.shape[0]:
-            depth = depth_map[cy, cx]
-            depth = np.clip(depth, 1e-3, None)
-        else:
-            depth = None
-            
         # Calculate object dimensions
         width = x2 - x1
         height = y2 - y1
@@ -72,36 +72,67 @@ def run_object_detection(model, frame, depth_map):
             'confidence': conf,
             'bbox': (x1, y1, x2, y2),
             'center': (cx, cy),
-            'depth': depth,
             'size': (width, height)
         })
         
     return objects, detections
 
-def visualize_detection_and_depth(frame, detections, depth_map):
+def visualize_combined(frame, objects, detections, depth_map, matched_pts1=None, matched_pts2=None):
+    """
+    Create a visualization combining YOLO detection, depth map, and visual odometry
+    """
+    # First create a color depth map
     depth_norm = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX)
-    depth_color = cv2.applyColorMap(depth_norm.astype(np.uint8), cv2.COLORMAP_MAGMA)
-    blended = cv2.addWeighted(frame, 0.6, depth_color, 0.4, 0)
-
-    for _, row in detections.iterrows():
-        x1, y1, x2, y2 = map(int, [row.xmin, row.ymin, row.xmax, row.ymax])
-        label = row['name']
-        conf = row['confidence']
-        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    depth_color = cv2.applyColorMap(depth_norm.astype(np.uint8), cv2.COLORMAP_PLASMA)
+    
+    # Create a semi-transparent overlay
+    alpha = 0.35  # Less dominance for depth color
+    combined = cv2.addWeighted(frame, 1 - alpha, depth_color, alpha, 0)
+    
+    # Draw YOLO bounding boxes prominently
+    for obj in objects:
+        x1, y1, x2, y2 = obj['bbox']
+        label = obj['label']
+        conf = obj['confidence']
+        
+        # Get depth at object center if available
+        cx, cy = obj['center']
         if 0 <= cx < depth_map.shape[1] and 0 <= cy < depth_map.shape[0]:
-            depth = depth_map[cy, cx]
-            depth = np.clip(depth, 1e-3, None)
+            rel_depth = depth_map[cy, cx]
+            depth_text = f" | d={rel_depth:.2f}"
         else:
-            depth = None
-        label_text = f"{label} {conf:.2f}"
-        if depth is not None:
-            label_text += f" | {depth:.2f}m"
-        cv2.rectangle(blended, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        (w, h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(blended, (x1, y1 - h - 5), (x1 + w, y1), (0, 255, 0), -1)
-        cv2.putText(blended, label_text, (x1, y1 - 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-    return blended
+            depth_text = ""
+        
+        # Draw box with thicker lines for visibility
+        cv2.rectangle(combined, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        
+        # Create visible label background
+        label_text = f"{label} {conf:.2f}{depth_text}"
+        (text_w, text_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(combined, (x1, y1 - text_h - 8), (x1 + text_w + 5, y1), (0, 0, 0), -1)
+        cv2.putText(combined, label_text, (x1 + 2, y1 - 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    # Draw visual odometry flow lines
+    if matched_pts1 is not None and matched_pts2 is not None:
+        # Draw a subset of lines to avoid clutter
+        max_lines = min(30, len(matched_pts1))
+        indices = np.linspace(0, len(matched_pts1)-1, max_lines, dtype=int)
+        
+        for i in indices:
+            if i < len(matched_pts1):
+                a, b = matched_pts1[i].ravel()
+                c, d = matched_pts2[i].ravel()
+                cv2.line(combined, (int(a), int(b)), (int(c), int(d)), (0, 165, 255), 2)  # Orange lines
+                cv2.circle(combined, (int(c), int(d)), 4, (0, 0, 255), -1)  # Red endpoints
+    
+    # Add legend for the combined view
+    cv2.putText(combined, "YOLO + Depth + VO", (10, 30), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    cv2.putText(combined, "Green: YOLO | Orange: VO Flow", (10, 60), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    return combined
 
 def process_visual_odometry(prev_gray, gray, prev_kp=None, prev_des=None, new_K=None):
     orb = cv2.ORB_create(1000)
@@ -143,19 +174,21 @@ def process_visual_odometry(prev_gray, gray, prev_kp=None, prev_des=None, new_K=
     
     return kp, des, R, t, matched_pts1, matched_pts2
 
-def draw_visual_odometry(prev_pts, curr_pts, frame):
-    vo_frame = frame.copy()
-    if prev_pts is not None and curr_pts is not None:
-        for i, (p_old, p_new) in enumerate(zip(prev_pts, curr_pts)):
-            a, b = p_old.ravel()
-            c, d = p_new.ravel()
-            cv2.line(vo_frame, (int(a), int(b)), (int(c), int(d)), (255, 0, 0), 2)
-            cv2.circle(vo_frame, (int(c), int(d)), 3, (0, 255, 0), -1)
-    return vo_frame
+def update_object_depth(objects, depth_map):
+    """Update objects with depth information"""
+    for obj in objects:
+        cx, cy = obj['center']
+        if 0 <= cx < depth_map.shape[1] and 0 <= cy < depth_map.shape[0]:
+            depth = depth_map[cy, cx]
+            depth = np.clip(depth, 1e-3, None)
+            obj['depth'] = depth
+        else:
+            obj['depth'] = None
+    return objects
 
-def plan_trajectory(objects, current_pose, depth_map, frame_shape):
+def plan_trajectory(objects, current_position, depth_map, frame_shape):
     """
-    Plan trajectory based on detected objects, current pose and depth map.
+    Plan trajectory based on detected objects, current position and depth map.
     Returns waypoints, obstacle map, and cost map for visualization.
     """
     h, w = frame_shape[:2]
@@ -164,7 +197,7 @@ def plan_trajectory(objects, current_pose, depth_map, frame_shape):
     
     # Mark detected objects as obstacles with safety margin
     for obj in objects:
-        if obj['depth'] is not None and obj['depth'] < 10.0:  # Filter by depth
+        if 'depth' in obj and obj['depth'] is not None:
             x1, y1, x2, y2 = obj['bbox']
             # Add safety margin around objects
             margin = 20
@@ -254,6 +287,13 @@ def visualize_trajectory(frame, trajectory_points, position, waypoints=None, obs
         cost_color = cv2.applyColorMap(cost_map, cv2.COLORMAP_JET)
         traj_map = cv2.addWeighted(traj_map, 0.3, cost_color, 0.7, 0)
     
+    # Add a grid for better spatial reference
+    grid_step = 50
+    for x in range(0, w, grid_step):
+        cv2.line(traj_map, (x, 0), (x, h), (50, 50, 50), 1)
+    for y in range(0, h, grid_step):
+        cv2.line(traj_map, (0, y), (w, y), (50, 50, 50), 1)
+    
     # Visualize obstacles
     if obstacle_map is not None:
         obstacle_vis = np.zeros((h, w, 3), dtype=np.uint8)
@@ -261,55 +301,39 @@ def visualize_trajectory(frame, trajectory_points, position, waypoints=None, obs
         traj_map = cv2.addWeighted(traj_map, 0.7, obstacle_vis, 0.3, 0)
     
     # Draw the trajectory history
-    for i in range(1, len(trajectory_points)):
-        pt1 = (int(trajectory_points[i-1][0]), int(trajectory_points[i-1][1]))
-        pt2 = (int(trajectory_points[i][0]), int(trajectory_points[i][1]))
-        cv2.line(traj_map, pt1, pt2, (0, 255, 255), 2)
+    points_list = list(trajectory_points)
+    if len(points_list) >= 2:
+        for i in range(1, len(points_list)):
+            pt1 = (int(points_list[i-1][0]), int(points_list[i-1][1]))
+            pt2 = (int(points_list[i][0]), int(points_list[i][1]))
+            cv2.line(traj_map, pt1, pt2, (0, 255, 255), 2)
     
     # Draw current position
-    cv2.circle(traj_map, position, 5, (255, 255, 0), -1)
+    if position:
+        cv2.circle(traj_map, position, 7, (255, 255, 0), -1)
+        cv2.circle(traj_map, position, 9, (0, 0, 0), 1)  # Black outline for visibility
     
     # Draw planned waypoints
     if waypoints and len(waypoints) > 1:
         for i in range(1, len(waypoints)):
             cv2.line(traj_map, waypoints[i-1], waypoints[i], (0, 255, 0), 2)
         for point in waypoints:
-            cv2.circle(traj_map, point, 3, (0, 0, 255), -1)
+            cv2.circle(traj_map, point, 5, (0, 0, 255), -1)
+            cv2.circle(traj_map, point, 6, (255, 255, 255), 1)  # White outline
     
     # Add title and legend
-    title_bg = np.zeros((40, w, 3), dtype=np.uint8)
-    cv2.putText(title_bg, "Trajectory Planning", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    cv2.putText(traj_map, "Trajectory Planning", (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    cv2.putText(traj_map, "Yellow: Current Position | Green: Planned Path", (10, 60), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    cv2.putText(traj_map, "Cyan: History | Red: Obstacles", (10, 85), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
     
-    legend_bg = np.zeros((60, w, 3), dtype=np.uint8)
-    cv2.putText(legend_bg, "Yellow: Current Pos | Green: Planned Path | Cyan: History", (10, 20), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    cv2.putText(legend_bg, "Red: Obstacles | Color Map: Cost (Blue=Low, Red=High)", (10, 45), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    
-    # Combine
-    full_vis = np.vstack([title_bg, traj_map, legend_bg])
-    
-    return full_vis
-
-def combine_visualizations(yolo_depth, vo_frame):
-    """Combine YOLO+Depth and VO frames into one visualization"""
-    h, w = yolo_depth.shape[:2]
-    combined = np.zeros((h, w, 3), dtype=np.uint8)
-    
-    # Blend the two visualizations
-    combined = cv2.addWeighted(yolo_depth, 0.7, vo_frame, 0.3, 0)
-    
-    # Add labels
-    cv2.putText(combined, "YOLO + Depth + VO", (10, 30), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    
-    return combined
+    return traj_map
 
 def main():
     model = load_object_detection_model(device)
     midas, midas_transform = load_depth_model(device)
-
-    orb = cv2.ORB_create(1000)
     
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -350,10 +374,10 @@ def main():
         depth_map = run_depth_estimation(midas, midas_transform, rgb, device)
         
         # Run object detection
-        objects, detections = run_object_detection(model, undistorted, depth_map)
+        objects, detections = run_object_detection(model, undistorted)
         
-        # Create visualization with YOLO detections and depth
-        yolo_depth_vis = visualize_detection_and_depth(undistorted, detections, depth_map)
+        # Update objects with depth information
+        objects = update_object_depth(objects, depth_map)
         
         # Process visual odometry
         gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
@@ -376,8 +400,8 @@ def main():
             # Add to trajectory history
             trajectory_points.append(current_position)
         
-        # Draw visual odometry on frame
-        vo_frame = draw_visual_odometry(matched_pts1, matched_pts2, undistorted)
+        # Create combined visualization showing YOLO + Depth + VO
+        combined_vis = visualize_combined(undistorted, objects, detections, depth_map, matched_pts1, matched_pts2)
         
         # Plan trajectory based on detected objects and current position
         waypoints, obstacle_map, cost_map = plan_trajectory(objects, current_position, depth_map, undistorted.shape)
@@ -385,9 +409,6 @@ def main():
         # Create trajectory visualization
         trajectory_vis = visualize_trajectory(
             undistorted, trajectory_points, current_position, waypoints, obstacle_map, cost_map)
-        
-        # Combine YOLO+Depth+VO visualizations
-        combined_vis = combine_visualizations(yolo_depth_vis, vo_frame)
 
         # Show the two windows
         cv2.imshow('YOLO + Depth + VO', combined_vis)
