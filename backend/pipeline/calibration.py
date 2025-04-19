@@ -1,6 +1,9 @@
 import glob
 import cv2
 import numpy as np
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
 
 # Define chessboard size (number of internal corners)
 chessboard_size = (6, 8)  # For a 7x9 square chessboard (width x height)
@@ -14,7 +17,7 @@ objpoints = []
 imgpoints = []
 
 # Load calibration images
-images = glob.glob('pipeline/calibration_images/*.jpg')
+images = glob.glob(str(BASE_DIR / 'calibration_images/*.jpg'))
 if not images:
     print("Error: No JPEG images found in calibration_images folder.")
     exit()
@@ -34,9 +37,13 @@ for fname in images:
         corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), 
                                    criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
         imgpoints.append(corners2)
-        cv2.drawChessboardCorners(img, chessboard_size, corners2, ret)
-        cv2.imshow('Chessboard Corners', img)
-        cv2.waitKey(500)
+
+        show_images = False
+
+        if show_images:
+            cv2.drawChessboardCorners(img, chessboard_size, corners2, ret)
+            cv2.imshow('Chessboard Corners', img)
+            cv2.waitKey(500)
     else:
         print(f"Warning: Chessboard corners not found in {fname}")
 
@@ -53,8 +60,8 @@ if ret:
     print("Camera matrix K:\n", K)
     print("Distortion coefficients:\n", dist)
     # Save to files
-    np.save('pipeline/calibration/camera_matrix.npy', K)
-    np.save('pipeline/calibration/distortion_coeffs.npy', dist)
+    np.save(BASE_DIR / 'calibration/camera_matrix.npy', K)
+    np.save(BASE_DIR / 'calibration/distortion_coeffs.npy', dist)
     print("Calibration files saved successfully.")
 else:
     print("Error: Camera calibration failed.")

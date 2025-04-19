@@ -5,10 +5,14 @@ import warnings
 from collections import deque
 import math  # for atan2, degrees
 import os
+from pathlib import Path
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+CALIB_DIR = BASE_DIR / "pipeline" / "calibration"
+MODELS_DIR = BASE_DIR / "models"
 
 if os.environ.get("USE_TTS", "1") == "1":
     import pyttsx3
@@ -19,8 +23,8 @@ else:
 
 # --- Configuration ---
 try:
-    K = np.load('pipeline/calibration/camera_matrix.npy')
-    dist = np.load('pipeline/calibration/distortion_coeffs.npy')
+    K = np.load(CALIB_DIR / 'camera_matrix.npy')
+    dist = np.load(CALIB_DIR / 'distortion_coeffs.npy')
     print("Camera calibration files loaded successfully.")
 except FileNotFoundError:
     print("Error: camera_matrix.npy or distortion_coeffs.npy not found.")
@@ -37,31 +41,82 @@ device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is
 print(f"Using device: {device}")
 
 # --- Model Loading ---
-
 def load_object_detection_model(device):
+    """
+    Load YOLOv5 from a local clone + local weights (yolov5s.pt).
+    Falls back to the online hub if anything goes wrong.
+    """
+    repo_dir   = MODELS_DIR / "ultralytics_yolov5_master"
+    weight_path = repo_dir / "yolov5s.pt"
     try:
-        model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-        model.to(device)
-        model.eval()
-        print("YOLOv5 model loaded successfully.")
+        # 'custom' tells hubconf to load any .pt you give it via `path`
+        model = torch.hub.load(
+            str(repo_dir),
+            'custom',
+            path=str(weight_path),
+            source='local'
+        )
+        model.to(device).eval()
+        print(f"YOLOv5 loaded from local path {weight_path}")
         return model
+
     except Exception as e:
-        print(f"Error loading YOLOv5 model: {e}")
-        exit()
+        print(f"Local YOLO load failed ({e}), falling back to online…")
+        model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+        model.to(device).eval()
+        print("YOLOv5 loaded from ultralytics hub")
+        return model
 
 def load_depth_model(device):
+    """
+    Load MiDaS DPT_Hybrid from a local clone + local weights (dpt_hybrid_384.pt).
+    Falls back to the online hub if anything goes wrong.
+    """
+    repo_dir    = MODELS_DIR / "intel-isl_MiDaS_master"
+    weight_path = repo_dir / "dpt_hybrid_384.pt"
+    model_type  = "DPT_Hybrid"
+
     try:
-        model_type = "DPT_Hybrid"
-        midas = torch.hub.load("intel-isl/MiDaS", model_type, pretrained=True)
-        midas.to(device)
-        midas.eval()
-        midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
-        transform = midas_transforms.dpt_transform if "DPT" in model_type else midas_transforms.small_transform
-        print("MiDaS depth model loaded successfully.")
+        # load model architecture without weights
+        midas = torch.hub.load(
+            str(repo_dir),
+            model_type,
+            pretrained=False,   # don’t auto-download
+            source='local'
+        )
+        # now manually load your .pt
+        state_dict = torch.load(str(weight_path), map_location=device)
+        midas.load_state_dict(state_dict)
+        midas.to(device).eval()
+
+        # load transforms locally as before
+        midas_transforms = torch.hub.load(
+            str(repo_dir),
+            "transforms",
+            source='local'
+        )
+        transform = (
+            midas_transforms.dpt_transform
+            if "DPT" in model_type
+            else midas_transforms.small_transform
+        )
+
+        print(f"MiDaS {model_type} loaded from local path {weight_path}")
         return midas, transform
+
     except Exception as e:
-        print(f"Error loading MiDaS model: {e}")
-        exit()
+        print(f"Local MiDaS load failed ({e}), falling back to online…")
+        # fallback to remote
+        midas = torch.hub.load("intel-isl/MiDaS", model_type, pretrained=True)
+        midas.to(device).eval()
+        midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+        transform = (
+            midas_transforms.dpt_transform
+            if "DPT" in model_type
+            else midas_transforms.small_transform
+        )
+        print("MiDaS loaded from intel-isl hub")
+        return midas, transform
 
 # --- Natural Language Instruction Generator ---
 
