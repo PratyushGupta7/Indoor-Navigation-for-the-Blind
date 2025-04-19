@@ -4,13 +4,18 @@ import numpy as np
 import warnings
 from collections import deque
 import math  # for atan2, degrees
+import os
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
-import pyttsx3
 
-tts_engine = pyttsx3.init()
-tts_engine.setProperty('rate', 150)  # Set speech rate (optional)
+
+if os.environ.get("USE_TTS", "1") == "1":
+    import pyttsx3
+    tts_engine = pyttsx3.init()
+    tts_engine.setProperty('rate', 150)  # Set speech rate (optional)
+else:
+    tts_engine = None
 
 # --- Configuration ---
 try:
@@ -310,9 +315,10 @@ def visualize_trajectory(frame_shape, history, current_pos, waypoints=None, obs_
 
 # --- Main Loop ---
 
+YOLO = load_object_detection_model(device)
+MIDAS, TRANSFORM = load_depth_model(device)
+
 def main():
-    yolo = load_object_detection_model(device)
-    midas, transform = load_depth_model(device)
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: cannot open camera.")
@@ -347,8 +353,8 @@ def main():
         rgb = cv2.cvtColor(undist, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(undist, cv2.COLOR_BGR2GRAY)
 
-        depth_map = run_depth_estimation(midas, transform, rgb, device)
-        objects, _ = run_object_detection(yolo, undist)
+        depth_map = run_depth_estimation(MIDAS, TRANSFORM, rgb, device)
+        objects, _ = run_object_detection(YOLO, undist)
         objects = update_object_depth(objects, depth_map)
 
         kp, des, R, t, m1, m2 = process_visual_odometry(prev_gray, gray, prev_kp, prev_des, new_K)
@@ -365,7 +371,7 @@ def main():
         waypoints, obs_map, cost_vis = plan_trajectory(objects, curr_vis, depth_map, undist.shape)
         instructions = generate_instructions(waypoints)
         print(instructions)
-        if instructions and instructions[0] != "No path computed":
+        if tts_engine and instructions and instructions[0] != "No path computed":
             to_say = instructions[0]  # Say the first instruction
             tts_engine.say(to_say)
             tts_engine.runAndWait()
