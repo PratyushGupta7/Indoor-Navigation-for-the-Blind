@@ -21,7 +21,7 @@ COPY backend ./backend
 ENV PYTHONPATH=/app
 
 # 6) Expose Uvicorn port
-EXPOSE 8000
+EXPOSE 10000
 
 # 7) Run Uvicorn exactly as you do locally
-CMD ["uvicorn", "backend.api.api:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "backend.api.api:app", "--host", "0.0.0.0", "--port", "10000"]
