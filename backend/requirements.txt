@@ -1,0 +1,37 @@
+# Web API
+fastapi
+uvicorn[standard]
+
+# Core ML / DL
+torch
+torchvision
+torchaudio
+
+# Computer Vision
+opencv-python-headless
+scikit-image
+imageio
+matplotlib
+gitpython
+seaborn
+timm
+# ultralytics
+
+# Data Handling & Utils
+numpy<2.0
+pandas
+scipy
+
+# Text-to-Speech (your project uses this)
+pyttsx3
+
+# Machine Learning Utilities
+scikit-learn
+tqdm
+
+# Transformers / NLP (optional but common)
+transformers
+
+# File and OS Utilities
+python-multipart
+
