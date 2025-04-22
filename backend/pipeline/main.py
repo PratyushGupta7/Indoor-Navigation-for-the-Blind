@@ -3,450 +3,822 @@ import torch
 import numpy as np
 import warnings
 from collections import deque
-import math  # for atan2, degrees
-import os
-from pathlib import Path
+import math  
+import pyttsx3
+import threading
+import queue
+import time
+from concurrent.futures import ThreadPoolExecutor
+import sys
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-CALIB_DIR = BASE_DIR / "pipeline" / "calibration"
-MODELS_DIR = BASE_DIR / "models"
+#  TTS Setup 
+tts_queue = queue.Queue()
+tts_stop_event = threading.Event()
 
-if os.environ.get("USE_TTS", "1") == "1":
-    import pyttsx3
-    tts_engine = pyttsx3.init()
-    tts_engine.setProperty('rate', 150)  # Set speech rate (optional)
-else:
-    tts_engine = None
+def tts_worker():
+    """Dedicated thread for text-to-speech synthesis with error handling."""
+    print("TTS Worker started.")
+    engine = None
+    try:
+        engine = pyttsx3.init()
+        if engine is None:
+             raise RuntimeError("Failed to initialize pyttsx3 engine.")
+        engine.setProperty('rate', 165)
+        print("TTS Engine initialized successfully.")
 
-# --- Configuration ---
-try:
-    K = np.load(CALIB_DIR / 'camera_matrix.npy')
-    dist = np.load(CALIB_DIR / 'distortion_coeffs.npy')
-    print("Camera calibration files loaded successfully.")
-except FileNotFoundError:
-    print("Error: camera_matrix.npy or distortion_coeffs.npy not found.")
-    print("Please run a camera calibration script first.")
-    K = np.eye(3)
-    dist = np.zeros(5)
-    K[0, 2] = 320
-    K[1, 2] = 240
-    K[0, 0] = 400
-    K[1, 1] = 400
-    print("Using placeholder camera calibration. Results will be inaccurate.")
+        while not tts_stop_event.is_set():
+            try:
+                text_to_say = tts_queue.get(timeout=0.1)
+                if text_to_say is None:
+                    print("TTS Worker received stop signal.")
+                    break
+                print(f"TTS Saying: '{text_to_say}'")
+                engine.say(text_to_say)
+                engine.runAndWait()
+                tts_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"TTS Error during synthesis/speaking: {e}")
+                if not tts_queue.empty():
+                    try: tts_queue.get_nowait()
+                    except queue.Empty: pass
+                tts_queue.task_done() # Still need to call task_done
 
-device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-print(f"Using device: {device}")
+    except Exception as engine_init_error:
+         print(f"FATAL: Failed to initialize TTS engine: {engine_init_error}")
+    finally:
+        print("TTS Worker shutting down.")
+        if engine:
+             try: pass # pyttsx3 usually handles cleanup
+             except Exception as e: print(f"Error during TTS engine cleanup: {e}")
+        print("TTS Worker finished.")
+
+def speak(text):
+    """Adds text to the TTS queue if the worker is running."""
+    if tts_stop_event.is_set():
+        # print(f"TTS worker stopped, discarding: {text}")
+        return
+    if tts_queue.qsize() < 5:
+        try: tts_queue.put(text)
+        except Exception as e: print(f"Error putting text into TTS queue: {e}")
+    # else: print(f"TTS Queue full, discarding: {text}")
+
+
+# --- Device Selection ---
+def select_device():
+    """Selects the best available device (CUDA > MPS > CPU)."""
+    if torch.cuda.is_available():
+        dev = torch.device('cuda')
+        print("Using device: CUDA")
+        stream_depth = torch.cuda.Stream()
+        stream_objdet = torch.cuda.Stream()
+        return dev, stream_depth, stream_objdet
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        dev = torch.device('mps')
+        print("Using device: MPS")
+        return dev, None, None
+    else:
+        dev = torch.device('cpu')
+        print("Using device: CPU")
+        return dev, None, None
+
+device, stream_depth, stream_objdet = select_device()
+
+# --- Camera Calibration ---
+def load_calibration(filepath_matrix='camera_matrix.npy', filepath_coeffs='distortion_coeffs.npy'):
+    """Loads camera calibration files or returns default placeholders."""
+    try:
+        k = np.load(filepath_matrix)
+        dist_coeffs = np.load(filepath_coeffs)
+        print("Camera calibration files loaded successfully.")
+        # Ensure float32 type, important for OpenCV functions like PnP
+        return k.astype(np.float32), dist_coeffs.astype(np.float32)
+    except FileNotFoundError:
+        print("Warning: Camera calibration files not found.")
+        fw_placeholder, fh_placeholder = 640, 480
+        k = np.eye(3, dtype=np.float32)
+        dist_coeffs = np.zeros(5, dtype=np.float32)
+        k[0, 2] = fw_placeholder / 2.0
+        k[1, 2] = fh_placeholder / 2.0
+        k[0, 0] = fw_placeholder * 0.8
+        k[1, 1] = fw_placeholder * 0.8
+        print(f"Using placeholder camera calibration for {fw_placeholder}x{fh_placeholder}.")
+        return k, dist_coeffs
+    except Exception as e:
+        print(f"Error loading calibration files: {e}")
+        sys.exit(1)
+
+K, dist = load_calibration()
+
 
 # --- Model Loading ---
-def load_object_detection_model(device):
-    """
-    Load YOLOv5 from a local clone + local weights (yolov5s.pt).
-    Falls back to the online hub if anything goes wrong.
-    """
-    repo_dir   = MODELS_DIR / "ultralytics_yolov5_master"
-    weight_path = repo_dir / "yolov5s.pt"
+def load_object_detection_model(dev):
+    """Loads YOLOv5 model onto the specified device with error handling."""
     try:
-        # 'custom' tells hubconf to load any .pt you give it via `path`
-        model = torch.hub.load(
-            str(repo_dir),
-            'custom',
-            path=str(weight_path),
-            source='local'
-        )
-        model.to(device).eval()
-        print(f"YOLOv5 loaded from local path {weight_path}")
-        return model
-
-    except Exception as e:
-        print(f"Local YOLO load failed ({e}), falling back to online…")
         model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-        model.to(device).eval()
-        print("YOLOv5 loaded from ultralytics hub")
+        model.to(dev)
+        model.eval()
+        print(f"YOLOv5 model loaded successfully on {dev}.")
         return model
-
-def load_depth_model(device):
-    """
-    Load MiDaS DPT_Hybrid from a local clone + local weights (dpt_hybrid_384.pt).
-    Falls back to the online hub if anything goes wrong.
-    """
-    repo_dir    = MODELS_DIR / "intel-isl_MiDaS_master"
-    weight_path = repo_dir / "dpt_hybrid_384.pt"
-    model_type  = "DPT_Hybrid"
-
-    try:
-        # load model architecture without weights
-        midas = torch.hub.load(
-            str(repo_dir),
-            model_type,
-            pretrained=False,   # don’t auto-download
-            source='local'
-        )
-        # now manually load your .pt
-        state_dict = torch.load(str(weight_path), map_location=device)
-        midas.load_state_dict(state_dict)
-        midas.to(device).eval()
-
-        # load transforms locally as before
-        midas_transforms = torch.hub.load(
-            str(repo_dir),
-            "transforms",
-            source='local'
-        )
-        transform = (
-            midas_transforms.dpt_transform
-            if "DPT" in model_type
-            else midas_transforms.small_transform
-        )
-
-        print(f"MiDaS {model_type} loaded from local path {weight_path}")
-        return midas, transform
-
     except Exception as e:
-        print(f"Local MiDaS load failed ({e}), falling back to online…")
-        # fallback to remote
+        print(f"FATAL: Error loading YOLOv5 model: {e}")
+        speak("Error loading object detection model.")
+        sys.exit(1)
+
+def load_depth_model(dev):
+    """Loads MiDaS depth model onto the specified device with error handling."""
+    try:
+        model_type = "DPT_Hybrid" # Or "MiDaS_small" for speed, "DPT_Large" for accuracy
+        print(f"Loading MiDaS model type: {model_type}...")
         midas = torch.hub.load("intel-isl/MiDaS", model_type, pretrained=True)
-        midas.to(device).eval()
+        midas.to(dev)
+        midas.eval()
         midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
-        transform = (
-            midas_transforms.dpt_transform
-            if "DPT" in model_type
-            else midas_transforms.small_transform
-        )
-        print("MiDaS loaded from intel-isl hub")
+        transform = midas_transforms.dpt_transform if "DPT" in model_type else midas_transforms.small_transform
+        print(f"MiDaS {model_type} model loaded successfully on {dev}.")
         return midas, transform
+    except Exception as e:
+        print(f"FATAL: Error loading MiDaS model: {e}")
+        speak("Error loading depth estimation model.")
+        sys.exit(1)
 
 # --- Natural Language Instruction Generator ---
-
 def generate_instructions(waypoints, step_size=15, angle_threshold=30):
-    """
-    Converts a list of pixel-based waypoints into simple NL steps.
-    Groups consecutive identical actions and reports approximate pixel distance.
-    """
-    if len(waypoints) < 2:
+    if not waypoints or len(waypoints) < 2:
         return ["No path computed"]
     instructions = []
-    # Initial heading: "up" in image coords is toward decreasing y
     heading = np.array([0.0, -1.0])
     current_action = None
-    count = 0
-
+    segment_start_point = np.array(waypoints[0], dtype=float)
+    total_distance_current_action = 0.0
     for i in range(1, len(waypoints)):
         prev = np.array(waypoints[i-1], dtype=float)
         curr = np.array(waypoints[i], dtype=float)
         vec = curr - prev
         norm = np.linalg.norm(vec)
-        if norm < 1e-3:
-            continue
+        if norm < 1e-3: continue
         vec_norm = vec / norm
-
-        # Compute signed angle between heading and vec_norm
-        angle = math.degrees(
-            math.atan2(vec_norm[1], vec_norm[0]) - math.atan2(heading[1], heading[0])
-        )
-        angle = (angle + 180) % 360 - 180  # wrap to [-180,180]
-
-        if abs(angle) < angle_threshold:
-            action = "Move forward"
-            # heading unchanged
-        elif angle > 0:
-            action = "Turn right and move forward"
-            heading = vec_norm
+        segment_distance = norm
+        angle = math.degrees(math.atan2(np.cross(heading, vec_norm), np.dot(heading, vec_norm)))
+        action = ""; new_heading = heading
+        if abs(angle) < angle_threshold: action = "Move forward"
+        elif angle > 0: action = f"Turn {'left slightly' if angle < angle_threshold * 2 else 'left'} and move forward"; new_heading = vec_norm
+        else: action = f"Turn {'right slightly' if angle > -angle_threshold * 2 else 'right'} and move forward"; new_heading = vec_norm
+        if action == current_action: total_distance_current_action += segment_distance
         else:
-            action = "Turn left and move forward"
-            heading = vec_norm
-
-        if action == current_action:
-            count += 1
-        else:
-            if current_action is not None:
-                dist_px = count * step_size
-                instructions.append(f"{current_action} ~{dist_px:.0f} px")
-            current_action = action
-            count = 1
-
-    if current_action is not None:
-        dist_px = count * step_size
-        instructions.append(f"{current_action} ~{dist_px:.0f} px")
-
+            if current_action is not None: instructions.append(f"{current_action} ~{total_distance_current_action:.0f} px")
+            current_action = action; total_distance_current_action = segment_distance; segment_start_point = prev
+        heading = new_heading
+    if current_action is not None: instructions.append(f"{current_action} ~{total_distance_current_action:.0f} px")
+    if not instructions: return ["Path computed, but no movement needed or path too short."]
     return instructions
 
 # --- Core Processing Functions ---
 
-def run_depth_estimation(midas, transform, image_rgb, device):
-    input_tensor = transform(image_rgb).to(device)
-    if input_tensor.dim() == 3:
-        input_tensor = input_tensor.unsqueeze(0)
-    with torch.no_grad():
-        prediction = midas(input_tensor)
-        prediction = torch.nn.functional.interpolate(
-            prediction.unsqueeze(1),
-            size=image_rgb.shape[:2],
-            mode="bicubic",
-            align_corners=False
-        ).squeeze()
-    depth_map = prediction.cpu().numpy()
-    depth_map = cv2.medianBlur(depth_map.astype(np.float32), 5)
-    dmin, dmax = depth_map.min(), depth_map.max()
-    if dmax - dmin > 1e-6:
-        normalized = (depth_map - dmin) / (dmax - dmin)
-    else:
-        normalized = np.zeros_like(depth_map)
-    return normalized
+def run_depth_estimation(midas, transform, image_rgb, device, stream):
+    """Runs MiDaS depth estimation with denoising, potentially on CUDA stream."""
+    try:
+        input_tensor_cpu = transform(image_rgb)
+        input_tensor = input_tensor_cpu.to(device)
+        if input_tensor.dim() == 3: input_tensor = input_tensor.unsqueeze(0)
 
-def run_object_detection(model, frame):
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = model(rgb)
-    df = results.pandas().xyxy[0]
+        with torch.no_grad():
+            if device.type == 'cuda' and stream:
+                with torch.cuda.stream(stream):
+                    prediction = midas(input_tensor)
+                    prediction = torch.nn.functional.interpolate(
+                        prediction.unsqueeze(1), size=image_rgb.shape[:2],
+                        mode="bicubic", align_corners=False,
+                    ).squeeze()
+                stream.synchronize()
+            else: # MPS or CPU
+                 prediction = midas(input_tensor)
+                 prediction = torch.nn.functional.interpolate(
+                     prediction.unsqueeze(1), size=image_rgb.shape[:2],
+                     mode="bicubic", align_corners=False,
+                 ).squeeze()
+
+        depth_map = prediction.cpu().numpy().astype(np.float32) # Ensure float32
+
+        # Denoising
+        depth_map_filtered = cv2.medianBlur(depth_map, 5)
+        depth_map_filtered = cv2.bilateralFilter(depth_map_filtered, d=7, sigmaColor=80, sigmaSpace=80)
+
+        # Normalization (Inverse Depth: 1.0 = Close, 0.0 = Far)
+        dmin, dmax = depth_map_filtered.min(), depth_map_filtered.max()
+        if dmax - dmin > 1e-6:
+            normalized_inverse = (dmax - depth_map_filtered) / (dmax - dmin)
+        else:
+            normalized_inverse = np.ones_like(depth_map_filtered)
+
+        return np.clip(normalized_inverse, 0.0, 1.0).astype(np.float32) # Ensure float32 output
+
+    except Exception as e:
+        print(f"Error during depth estimation: {e}")
+        h, w = image_rgb.shape[:2]
+        return np.zeros((h, w), dtype=np.float32) # Return zero map (max distance)
+
+
+def run_object_detection(model, frame, device, stream):
+    """Runs YOLOv5 object detection with error handling."""
     objects = []
-    for _, row in df.iterrows():
-        x1, y1, x2, y2 = map(int, [row['xmin'], row['ymin'], row['xmax'], row['ymax']])
-        cx, cy = (x1 + x2)//2, (y1 + y2)//2
-        objects.append({
-            'label': row['name'],
-            'confidence': row['confidence'],
-            'bbox': (x1, y1, x2, y2),
-            'center': (cx, cy),
-            'size': (x2 - x1, y2 - y1)
-        })
-    return objects, df
+    try:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        with torch.no_grad():
+            if device.type == 'cuda' and stream:
+                 with torch.cuda.stream(stream): results = model(rgb, size=frame.shape[1])
+                 stream.synchronize()
+            else: results = model(rgb, size=frame.shape[1])
 
-def process_visual_odometry(prev_gray, curr_gray, prev_kp, prev_des, K):
-    orb = cv2.ORB_create(1000)
-    kp, des = orb.detectAndCompute(curr_gray, None)
-    R = t = None
-    pts1 = pts2 = None
+            df = results.pandas().xyxy[0]
+            h, w = frame.shape[:2]
+            for _, row in df.iterrows():
+                x1, y1, x2, y2 = map(int, [row['xmin'], row['ymin'], row['xmax'], row['ymax']])
+                x1, y1 = max(0, x1), max(0, y1); x2, y2 = min(w - 1, x2), min(h - 1, y2)
+                if x1 >= x2 or y1 >= y2: continue
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                objects.append({'label': row['name'], 'confidence': row['confidence'],
+                                'bbox': (x1, y1, x2, y2), 'center': (cx, cy),
+                                'size': (x2 - x1, y2 - y1)})
+        return objects, df # df might be useful elsewhere
+    except Exception as e:
+        print(f"Error during object detection: {e}")
+        return [], None
 
-    if prev_gray is not None and prev_des is not None and prev_kp is not None:
+# =============================================================================
+# === Depth-Aided Visual Odometry using PnP ===
+# =============================================================================
+def process_visual_odometry_pnp(
+    prev_gray, curr_gray,
+    prev_kp, prev_des,
+    prev_depth_map_closeness, # Needs depth map from the PREVIOUS frame
+    K_intrinsic, # Camera intrinsic matrix (new_K)
+    dist_coeffs, # Distortion coefficients (use None if images are undistorted)
+    depth_vo_scale=5.0, # **Crucial Tuning Parameter**: Maps normalized depth to a metric scale for PnP
+    min_depth_closeness=0.05 # Ignore features corresponding to very far points (low closeness)
+    ):
+    """
+    Estimates camera pose using ORB feature matching and PnP with depth information.
+
+    Args:
+        prev_gray: Grayscale image of the previous frame.
+        curr_gray: Grayscale image of the current frame.
+        prev_kp: Keypoints detected in the previous frame.
+        prev_des: Descriptors for keypoints in the previous frame.
+        prev_depth_map_closeness: Normalized inverse depth map (1=close, 0=far) of the previous frame.
+        K_intrinsic: Camera intrinsic matrix (3x3 NumPy float32 array).
+        dist_coeffs: Camera distortion coefficients (NumPy array), or None if undistorted.
+        depth_vo_scale: Heuristic scale factor to convert normalized depth into a metric Z value.
+        min_depth_closeness: Minimum closeness value (0-1) to consider a point for 3D projection.
+
+    Returns:
+        Tuple: (kp, des, R_vo, t_vo, pts1_inliers, pts2_inliers)
+            kp: Keypoints detected in the current frame.
+            des: Descriptors for keypoints in the current frame.
+            R_vo: Estimated rotation matrix (3x3) transforming points from previous to current frame coords. None on failure.
+            t_vo: Estimated translation vector (3x1) of current cam origin relative to previous cam origin,
+                  expressed in previous cam coords. None on failure.
+            pts1_inliers: 2D keypoints from previous frame identified as inliers by PnP-RANSAC.
+            pts2_inliers: Corresponding 2D keypoints from current frame identified as inliers.
+    """
+    kp_curr, des_curr = None, None
+    R_vo, t_vo = None, None
+    pts1_inliers, pts2_inliers = None, None
+
+    # --- Feature Detection (Current Frame) ---
+    try:
+        orb = cv2.ORB_create(nfeatures=1500, scaleFactor=1.2, nlevels=8, edgeThreshold=31, firstLevel=0, WTA_K=2, scoreType=cv2.ORB_HARRIS_SCORE, patchSize=31, fastThreshold=20)
+        # orb = cv2.ORB_create(nfeatures=1000) # Simpler ORB
+        kp_curr, des_curr = orb.detectAndCompute(curr_gray, None)
+        if kp_curr is None or len(kp_curr) == 0 or des_curr is None:
+            # print("VO-PnP: No features detected in current frame.")
+            return kp_curr, des_curr, R_vo, t_vo, pts1_inliers, pts2_inliers
+    except cv2.error as e:
+        print(f"VO-PnP: OpenCV Error during feature detection: {e}")
+        return kp_curr, des_curr, R_vo, t_vo, pts1_inliers, pts2_inliers
+    except Exception as e:
+        print(f"VO-PnP: General Error during feature detection: {e}")
+        return kp_curr, des_curr, R_vo, t_vo, pts1_inliers, pts2_inliers
+
+
+    # --- Check Previous Frame Data ---
+    if prev_gray is None or prev_kp is None or len(prev_kp) == 0 or prev_des is None or prev_depth_map_closeness is None:
+        # print("VO-PnP: Missing valid previous frame data (image, kp, des, or depth).")
+        return kp_curr, des_curr, R_vo, t_vo, pts1_inliers, pts2_inliers
+
+    # --- Feature Matching ---
+    try:
         bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        matches = sorted(bf.match(prev_des, des), key=lambda m: m.distance)
-        good = matches[:max(int(len(matches)*0.7), 20)]
-        if len(good) >= 8:
-            pts1 = np.float32([prev_kp[m.queryIdx].pt for m in good]).reshape(-1,1,2)
-            pts2 = np.float32([kp[m.trainIdx].pt for m in good]).reshape(-1,1,2)
-            E, mask = cv2.findEssentialMat(pts2, pts1, K, cv2.RANSAC, 0.999, 1.0, 1000)
-            if E is not None and mask is not None:
-                inliers = mask.ravel()==1
-                p1, p2 = pts1[inliers], pts2[inliers]
-                if len(p1) >= 8:
-                    _, Rr, tr, _ = cv2.recoverPose(E, p2, p1, K)
-                    if np.isfinite(Rr).all() and np.isfinite(tr).all():
-                        R, t = Rr, tr
-                pts1, pts2 = p1, p2
-    else:
-        if prev_gray is None:
-            print("VO: waiting for first frame.")
-        elif des is None or len(kp)==0:
-            print("VO: no features detected.")
-        else:
-            print("VO: no prev features.")
+        matches = bf.match(prev_des, des_curr)
+        matches = sorted(matches, key=lambda m: m.distance) # Sort by quality
+        # Filter matches based on distance (optional but can help)
+        # good_distance_threshold = 50 # Example threshold, adjust based on descriptor quality
+        # matches = [m for m in matches if m.distance < good_distance_threshold]
 
-    return kp, des, R, t, pts1, pts2
+    except cv2.error as e:
+        print(f"VO-PnP: OpenCV Error during matching: {e}")
+        return kp_curr, des_curr, R_vo, t_vo, pts1_inliers, pts2_inliers
+    except Exception as e:
+        print(f"VO-PnP: General Error during matching: {e}")
+        return kp_curr, des_curr, R_vo, t_vo, pts1_inliers, pts2_inliers
 
-def update_object_depth(objects, depth_map):
-    h, w = depth_map.shape
-    for o in objects:
-        cx, cy = o['center']
-        if 0<=cx<w and 0<=cy<h:
-            o['depth'] = float(np.clip(depth_map[cy, cx], 0.0, 1.0))
-        else:
-            o['depth'] = None
-    return objects
 
-def plan_trajectory(objects, current_pos, depth_map, frame_shape):
-    h, w = frame_shape[:2]
-    obstacle_map = np.zeros((h, w), dtype=np.uint8)
-    cost_base = np.zeros((h, w), dtype=np.float32)
-    margin = 25
-    for o in objects:
-        if o.get('depth') is not None:
-            x1,y1,x2,y2 = o['bbox']
-            x1m, y1m = max(0, x1-margin), max(0, y1-margin)
-            x2m, y2m = min(w, x2+margin), min(h, y2+margin)
-            obstacle_map[y1m:y2m, x1m:x2m] = 255
+    # --- Prepare Points for PnP ---
+    # We need 3D points from the PREVIOUS frame and corresponding 2D points from the CURRENT frame.
+    object_points_3d = [] # 3D points in previous camera coordinate system
+    image_points_2d = []  # Corresponding 2D points in current image
+    original_indices = [] # Keep track of original match indices for inlier filtering later
 
-    dt = cv2.distanceTransform(255-obstacle_map, cv2.DIST_L2, 5)
-    cv2.normalize(dt, dt, 0, 1.0, cv2.NORM_MINMAX)
-    obs_cost = (1.0-dt)*200
-    depth_cost = depth_map * 55
-    final_cost = cost_base + obs_cost + depth_cost
-    final_cost[obstacle_map==255] = 10000.0
-    cost_vis = cv2.normalize(final_cost, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    h_prev, w_prev = prev_depth_map_closeness.shape
+    fx, fy = K_intrinsic[0, 0], K_intrinsic[1, 1]
+    cx, cy = K_intrinsic[0, 2], K_intrinsic[1, 2]
+    epsilon = 1e-6 # To avoid division by zero or Z=0
 
-    start = current_pos
-    goal = (w//2, h//4)
-    waypoints = [start]
-    visited = {start}
-    step = 15
-    thresh = step*1.5
-    for _ in range(100):
-        if np.linalg.norm(np.array(start)-np.array(goal))<thresh:
-            waypoints.append(goal)
-            break
-        best = float('inf')
-        nxt = None
-        for dx in (-step,0,step):
-            for dy in (-step,0,step):
-                if dx==0 and dy==0: continue
-                x,y = start[0]+dx, start[1]+dy
-                if 0<=x<w and 0<=y<h and obstacle_map[y,x]==0 and (x,y) not in visited:
-                    cost = final_cost[y,x] + 1.5*np.linalg.norm(np.array((x,y))-np.array(goal))
-                    if cost<best:
-                        best, nxt = cost, (x,y)
-        if nxt is None:
-            break
-        waypoints.append(nxt)
-        visited.add(nxt)
-        start = nxt
-    return waypoints, obstacle_map, cost_vis
+    min_matches_for_pnp = 6 # Minimum required points for PnP RANSAC
 
-# --- Visualization with Instruction Overlay ---
+    if len(matches) < min_matches_for_pnp:
+         # print(f"VO-PnP: Not enough matches ({len(matches)} < {min_matches_for_pnp}).")
+         return kp_curr, des_curr, R_vo, t_vo, pts1_inliers, pts2_inliers
 
-def visualize_combined(frame, objects, matched1=None, matched2=None, instructions=None):
-    out = frame.copy()
-    h, w = out.shape[:2]
-    # Draw YOLO
-    for o in objects:
-        x1,y1,x2,y2 = o['bbox']
-        cv2.rectangle(out, (x1,y1), (x2,y2), (0,255,0), 2)
-        text = f"{o['label']} {o['confidence']:.2f}"
-        if o.get('depth') is not None:
-            text += f" | d={o['depth']:.2f}"
-        tw, th = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5,1)[0]
-        cv2.rectangle(out, (x1,y1-th-4), (x1+tw+4, y1), (0,0,0), -1)
-        cv2.putText(out, text, (x1+2,y1-2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255),1)
+    try:
+        for i, m in enumerate(matches):
+            # Get 2D point from previous frame (queryIdx)
+            pt1_idx = m.queryIdx
+            pt1_2d = prev_kp[pt1_idx].pt # (u, v) coordinates
+            u1, v1 = int(round(pt1_2d[0])), int(round(pt1_2d[1]))
 
-    # Draw VO matches
-    if matched1 is not None and matched2 is not None:
-        num = min(len(matched1), 50)
-        idxs = np.linspace(0, len(matched1)-1, num, dtype=int)
-        for i in idxs:
-            p1 = tuple(map(int, matched1[i].ravel()))
-            p2 = tuple(map(int, matched2[i].ravel()))
-            if 0<=p1[0]<w and 0<=p1[1]<h and 0<=p2[0]<w and 0<=p2[1]<h:
-                cv2.line(out, p1, p2, (0,165,255), 1)
-                cv2.circle(out, p2, 3, (0,0,255), -1)
+            # Check if point is within depth map bounds
+            if 0 <= v1 < h_prev and 0 <= u1 < w_prev:
+                # Get closeness value from previous depth map
+                closeness = prev_depth_map_closeness[v1, u1]
 
-    # Instruction overlay
-    if instructions:
-        y = 30
-        cv2.putText(out, "Nav Instructions:", (10,y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0),2)
-        for instr in instructions[:3]:
-            y += 25
-            cv2.putText(out, instr, (10,y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255),1)
+                # Filter points that are too far (low closeness) or have invalid depth
+                if closeness >= min_depth_closeness:
+                    # Convert closeness (0-1) to a scaled Z depth (metric estimate)
+                    # Z = scale * (1 - closeness) --> Larger closeness means smaller Z
+                    Z = depth_vo_scale * (1.0 - closeness + epsilon)
 
-    return out
+                    # Unproject 2D point (u1, v1) to 3D (X, Y, Z) using intrinsics
+                    X = (u1 - cx) * Z / fx
+                    Y = (v1 - cy) * Z / fy
 
-def visualize_trajectory(frame_shape, history, current_pos, waypoints=None, obs_map=None, cost_vis=None):
-    h, w = frame_shape[:2]
-    canvas = np.zeros((h, w, 3), dtype=np.uint8)
-    if cost_vis is not None:
-        colored = cv2.applyColorMap(cost_vis, cv2.COLORMAP_JET)
-        canvas = cv2.addWeighted(canvas, 0.5, colored, 0.5, 0)
-    for x in range(0,w,50):
-        cv2.line(canvas, (x,0), (x,h), (70,70,70),1)
-    for y in range(0,h,50):
-        cv2.line(canvas, (0,y), (w,y), (70,70,70),1)
-    if obs_map is not None:
-        overlay = np.zeros_like(canvas)
-        overlay[obs_map>0] = (0,0,200)
-        canvas = cv2.addWeighted(canvas, 0.7, overlay, 0.3, 0)
-    pts = list(history)
-    for i in range(1,len(pts)):
-        cv2.line(canvas, tuple(map(int,pts[i-1])), tuple(map(int,pts[i])), (255,255,0),2)
-    if waypoints and len(waypoints)>1:
-        for i in range(1,len(waypoints)):
-            cv2.line(canvas, tuple(map(int,waypoints[i-1])), tuple(map(int,waypoints[i])), (0,255,0),2)
-        for p in waypoints:
-            cv2.circle(canvas, tuple(map(int,p)),5,(0,0,255),-1)
-            cv2.circle(canvas, tuple(map(int,p)),6,(255,255,255),1)
-    if current_pos:
-        cv2.circle(canvas, tuple(map(int,current_pos)),7,(0,255,255),-1)
-        cv2.circle(canvas, tuple(map(int,current_pos)),8,(0,0,0),1)
-    cv2.putText(canvas, "Trajectory View", (10,30), cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,255),2)
-    return canvas
+                    # Get corresponding 2D point from current frame (trainIdx)
+                    pt2_idx = m.trainIdx
+                    pt2_2d = kp_curr[pt2_idx].pt
 
-# --- Main Loop ---
+                    # Add the pair
+                    object_points_3d.append([X, Y, Z])
+                    image_points_2d.append(list(pt2_2d))
+                    original_indices.append(i) # Store index of the match
 
-YOLO = load_object_detection_model(device)
-MIDAS, TRANSFORM = load_depth_model(device)
+    except IndexError as e:
+         print(f"VO-PnP: Index error during point preparation: {e}. Match index {i}, pt1_idx {pt1_idx}, pt2_idx {pt2_idx}")
+         # This might happen if keypoint indices are somehow invalid.
+         return kp_curr, des_curr, R_vo, t_vo, pts1_inliers, pts2_inliers
+    except Exception as e:
+         print(f"VO-PnP: Error during point preparation: {e}")
+         return kp_curr, des_curr, R_vo, t_vo, pts1_inliers, pts2_inliers
+
+
+    # Check if we have enough valid points for PnP
+    num_valid_points = len(object_points_3d)
+    if num_valid_points < min_matches_for_pnp:
+        # print(f"VO-PnP: Not enough valid 3D points generated ({num_valid_points} < {min_matches_for_pnp}).")
+        return kp_curr, des_curr, R_vo, t_vo, pts1_inliers, pts2_inliers
+
+    # Convert lists to NumPy arrays (required by solvePnPRansac)
+    object_points_3d = np.array(object_points_3d, dtype=np.float32)
+    image_points_2d = np.array(image_points_2d, dtype=np.float32)
+
+    # --- Solve PnP using RANSAC ---
+    try:
+        # Use None for distortion coeffs if images used for kp_curr are already undistorted
+        # Common flags: cv2.SOLVEPNP_ITERATIVE, cv2.SOLVEPNP_EPNP, cv2.SOLVEPNP_AP3P
+        # RANSAC parameters might need tuning:
+        iterations_count = 100
+        reprojection_error_threshold = 4.0 # Pixels - adjust based on image resolution and feature quality
+        confidence = 0.99 # Probability that the solution is correct
+
+        success, rvec, tvec, inliers_indices = cv2.solvePnPRansac(
+            object_points_3d,
+            image_points_2d,
+            K_intrinsic,
+            distCoeffs=None, # Assuming undistorted points fed to PnP
+            iterationsCount=iterations_count,
+            reprojectionError=reprojection_error_threshold,
+            confidence=confidence,
+            flags=cv2.SOLVEPNP_ITERATIVE # Or EPNP
+        )
+
+        if success and inliers_indices is not None and len(inliers_indices) >= min_matches_for_pnp:
+             # PnP gives rotation (rvec) and translation (tvec) that transform points
+             # from the WORLD (previous camera) frame to the CURRENT camera frame.
+
+             # Convert rotation vector to rotation matrix
+             R_pnp, _ = cv2.Rodrigues(rvec)
+
+             # Calculate the relative motion (R_vo, t_vo)
+             # R_vo is the rotation from prev to curr frame: R_vo = R_pnp
+             R_vo = R_pnp
+
+             # t_vo is the translation of the current camera origin relative to the previous one,
+             # expressed in the previous camera's coordinate system.
+             # tvec is the translation of the *previous* origin in the *current* frame coords.
+             # t_vo = -R_pnp^T * tvec
+             t_vo = -R_pnp.T @ tvec
+
+             # --- Filter original matched keypoints based on PnP inliers ---
+             if inliers_indices is not None:
+                 inliers_indices = inliers_indices.flatten() # Ensure it's a flat array
+                 # Get the original match indices corresponding to the PnP inliers
+                 original_inlier_match_indices = [original_indices[i] for i in inliers_indices]
+
+                 # Extract the corresponding 2D points from prev (pts1) and current (pts2) frames
+                 pts1_inliers = np.array([prev_kp[matches[i].queryIdx].pt for i in original_inlier_match_indices], dtype=np.float32)
+                 pts2_inliers = np.array([kp_curr[matches[i].trainIdx].pt for i in original_inlier_match_indices], dtype=np.float32)
+                 # print(f"VO-PnP Success: Found {len(inliers_indices)} inliers out of {num_valid_points} potential points.")
+             else:
+                 # Should not happen if success is true and len(inliers_indices) is checked, but good practice
+                 print("VO-PnP: Success reported but inliers_indices is None.")
+                 R_vo, t_vo = None, None # Mark as failure
+                 pts1_inliers, pts2_inliers = None, None
+
+        # else: print(f"VO-PnP: solvePnPRansac failed. Success={success}, Inliers={len(inliers_indices) if inliers_indices is not None else 'None'}")
+
+
+    except cv2.error as e:
+        print(f"VO-PnP: OpenCV Error during PnP solving: {e}")
+        # R_vo, t_vo remain None
+    except Exception as e:
+        print(f"VO-PnP: General Error during PnP solving: {e}")
+        # R_vo, t_vo remain None
+
+    # Return current keypoints/descriptors, estimated pose (R_vo, t_vo), and inlier points
+    return kp_curr, des_curr, R_vo, t_vo, pts1_inliers, pts2_inliers
+
+# =============================================================================
+
+
+def update_object_depth(objects, depth_map_closeness):
+    """Assigns closeness value (0=far, 1=close) to detected objects."""
+    try:
+        h, w = depth_map_closeness.shape
+        for o in objects:
+            cx, cy = o['center']
+            if 0 <= cy < h and 0 <= cx < w:
+                o['closeness'] = float(depth_map_closeness[cy, cx])
+            else: o['closeness'] = 0.0
+        return objects
+    except Exception as e:
+        print(f"Error updating object depth: {e}")
+        for o in objects:
+            if 'closeness' not in o: o['closeness'] = 0.0
+        return objects
+
+
+def plan_trajectory(objects, current_pos_px, depth_map_closeness, frame_shape):
+    """Plans a simple trajectory avoiding obstacles using a cost map."""
+    try:
+        h, w = frame_shape[:2]
+        cost_map = np.zeros((h, w), dtype=np.float32)
+        obstacle_map_viz = np.zeros((h, w), dtype=np.uint8)
+        obstacle_penalty = 15000.0; margin_px = 15; closeness_threshold_obstacle = 0.5
+        depth_cost_factor = 250.0; proximity_cost_factor = 180.0
+
+        for o in objects: # Obstacle cost
+            if o.get('closeness', 0.0) > closeness_threshold_obstacle:
+                x1, y1, x2, y2 = o['bbox']
+                x1m, y1m = max(0, x1 - margin_px), max(0, y1 - margin_px)
+                x2m, y2m = min(w, x2 + margin_px), min(h, y2 + margin_px)
+                cost_map[y1m:y2m, x1m:x2m] += obstacle_penalty
+                obstacle_map_viz[y1m:y2m, x1m:x2m] = 255
+
+        cost_map += depth_map_closeness * depth_cost_factor # Depth cost
+        dt = cv2.distanceTransform(255 - obstacle_map_viz, cv2.DIST_L2, 5)
+        cv2.normalize(dt, dt, 0, 1.0, cv2.NORM_MINMAX)
+        cost_map += (1.0 - dt) * proximity_cost_factor # Proximity cost
+        cost_map[obstacle_map_viz == 255] = obstacle_penalty * 1.5 # Ensure max cost
+
+        # Greedy Path Finding
+        start_point = tuple(map(int, current_pos_px)); goal_point = (w // 2, h // 4)
+        waypoints = [start_point]; visited = {start_point}; current_wp = start_point
+        max_steps = 150; step_size = 15; goal_reached_threshold = step_size * 1.5
+        for _ in range(max_steps):
+            if np.linalg.norm(np.array(current_wp) - np.array(goal_point)) < goal_reached_threshold:
+                if current_wp != goal_point: waypoints.append(goal_point); break
+            best_cost = float('inf'); next_wp = None
+            for dx in [-step_size, 0, step_size]:
+                for dy in [-step_size, 0, step_size]:
+                    if dx == 0 and dy == 0: continue
+                    nx, ny = current_wp[0] + dx, current_wp[1] + dy
+                    if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in visited and obstacle_map_viz[ny, nx] != 255:
+                        try: map_cost = cost_map[ny, nx]
+                        except IndexError: continue
+                        heuristic_cost = 1.5 * np.linalg.norm(np.array((nx, ny)) - np.array(goal_point))
+                        total_cost = map_cost + heuristic_cost
+                        if total_cost < best_cost: best_cost = total_cost; next_wp = (nx, ny)
+            if next_wp is None: break
+            waypoints.append(next_wp); visited.add(next_wp); current_wp = next_wp
+
+        cost_vis = cv2.normalize(cost_map, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+        cost_vis_color = cv2.applyColorMap(cost_vis, cv2.COLORMAP_JET)
+        cost_vis_color[obstacle_map_viz == 255] = (0, 0, 200) # Overlay obstacles
+        return waypoints, obstacle_map_viz, cost_vis_color
+    except Exception as e:
+        print(f"Error during trajectory planning: {e}")
+        h, w = frame_shape[:2]
+        return [current_pos_px], np.zeros((h, w), dtype=np.uint8), np.zeros((h, w, 3), dtype=np.uint8)
+
+
+# --- Visualization ---
+def visualize_combined(frame, objects, matched_pts1=None, matched_pts2=None, instructions=None, fps=0):
+    """Draws detections, VO matches, instructions, and FPS on the frame."""
+    try:
+        out_frame = frame.copy(); h, w = out_frame.shape[:2]
+        for o in objects: # Detections
+            x1, y1, x2, y2 = o['bbox']; color = (0, 255, 0); thickness = 2
+            closeness = o.get('closeness'); label = f"{o['label']} {o['confidence']:.2f}"
+            if closeness is not None:
+                label += f" | Close={closeness:.2f}"
+                if closeness > 0.8: color, thickness = (0, 0, 255), 3
+                elif closeness > 0.5: color = (0, 165, 255)
+            cv2.rectangle(out_frame, (x1, y1), (x2, y2), color, thickness)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(out_frame, (x1, y1 - th - 4), (x1 + tw + 4, y1), color, -1)
+            cv2.putText(out_frame, label, (x1 + 2, y1 - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        if matched_pts1 is not None and matched_pts2 is not None and len(matched_pts1) > 0: # VO Matches
+            num_to_draw = min(len(matched_pts1), 75) # Draw more points for PnP maybe
+            indices = np.linspace(0, len(matched_pts1) - 1, num_to_draw, dtype=int)
+            for i in indices:
+                try:
+                    pt1 = tuple(map(int, matched_pts1[i].ravel())); pt2 = tuple(map(int, matched_pts2[i].ravel()))
+                    if 0 <= pt1[0] < w and 0 <= pt1[1] < h and 0 <= pt2[0] < w and 0 <= pt2[1] < h:
+                        cv2.line(out_frame, pt1, pt2, (0, 165, 255), 1) # Orange lines
+                        cv2.circle(out_frame, pt2, 3, (255, 0, 0), -1)    # Blue circles for PnP inliers
+                except IndexError: continue
+        if instructions: # Instructions
+            y_offset = 30; cv2.putText(out_frame, "Nav Instructions:", (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv2.LINE_AA)
+            for i, instruction in enumerate(instructions[:4]): y_offset += 25; cv2.putText(out_frame, instruction, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(out_frame, f"FPS: {fps:.2f}", (w - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA) # FPS
+        return out_frame
+    except Exception as e: print(f"Error during combined visualization: {e}"); return frame
+
+def visualize_trajectory(frame_shape, history_deque, current_pos_px, waypoints=None, obstacle_map_vis=None, cost_map_vis_color=None):
+    """Creates a top-down trajectory view."""
+    try:
+        h, w = frame_shape[:2]
+        canvas = cost_map_vis_color if cost_map_vis_color is not None else np.zeros((h, w, 3), dtype=np.uint8)
+        history_pts = list(history_deque) # History Path
+        if len(history_pts) >= 2:
+            try: pts_np = np.array(history_pts, dtype=np.int32).reshape((-1, 1, 2)); cv2.polylines(canvas, [pts_np], isClosed=False, color=(255, 255, 0), thickness=2)
+            except Exception as e: print(f"Error drawing history polyline: {e}")
+        if waypoints and len(waypoints) >= 2: # Planned Path
+            try:
+                waypoints_np = np.array(waypoints, dtype=np.int32).reshape((-1, 1, 2)); cv2.polylines(canvas, [waypoints_np], isClosed=False, color=(0, 255, 0), thickness=2)
+                for p in waypoints: cv2.circle(canvas, tuple(map(int, p)), 5, (0, 0, 255), -1); cv2.circle(canvas, tuple(map(int, p)), 6, (255, 255, 255), 1)
+            except Exception as e: print(f"Error drawing waypoint polyline/circles: {e}")
+        if current_pos_px: # Current Position
+            try: pos_int = tuple(map(int, current_pos_px)); cv2.circle(canvas, pos_int, 7, (0, 255, 255), -1); cv2.circle(canvas, pos_int, 8, (0, 0, 0), 1)
+            except Exception as e: print(f"Error drawing current position circle: {e}")
+        cv2.putText(canvas, "Trajectory View (Top-Down)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+        return canvas
+    except Exception as e: print(f"Error during trajectory visualization: {e}"); h, w = frame_shape[:2]; return np.zeros((h, w, 3), dtype=np.uint8)
+
+# --- Main Execution ---
 
 def main():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Error: cannot open camera.")
-        return
+    # --- Initialization ---
+    print("System initializing...")
+    speak("System initializing.")
+    tts_thread = threading.Thread(target=tts_worker, daemon=True)
+    tts_thread.start()
 
-    fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Camera resolution: {fw}x{fh}")
+    yolo_model = load_object_detection_model(device)
+    midas_model, midas_transform = load_depth_model(device)
 
-    prev_gray = prev_kp = prev_des = None
-    new_K = K.copy()
-    traj_hist = deque(maxlen=150)
-    origin = (fw//2, fh//2)
-    curr_vis = origin
-    traj_hist.append(curr_vis)
-    cum_R = np.eye(3)
-    cum_t = np.zeros((3,1))
-    scale = 1.0
-    frame_count = 0
+    cap = None
+    try:
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened(): raise IOError("Cannot open camera.")
+        fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"Camera opened successfully: {fw}x{fh}")
+        # Update placeholder K if needed
+        if K[0, 0] > 500 and K[0, 2] != fw/2.0 :
+            print("Updating placeholder K principal point.")
+            K[0, 2] = fw / 2.0
+            K[1, 2] = fh / 2.0
+    except Exception as e:
+        print(f"FATAL: Error initializing camera: {e}")
+        speak("Error initializing camera.")
+        tts_stop_event.set()
+        if tts_thread.is_alive(): 
+            try: 
+                tts_queue.put(None); tts_thread.join(timeout=2)
+            except Exception as te: print(f"Error stopping TTS thread: {te}")
+        if cap is not None: cap.release(); cv2.destroyAllWindows(); sys.exit(1)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    # Ensure K is float32 for PnP
+    K_intrinsic_calib = K.astype(np.float32)
+    new_K, roi = cv2.getOptimalNewCameraMatrix(K_intrinsic_calib, dist, (fw, fh), alpha=0.9, newImgSize=(fw, fh))
+    new_K = new_K.astype(np.float32) # Ensure new_K is also float32
+    mapx, mapy = cv2.initUndistortRectifyMap(K_intrinsic_calib, dist, None, new_K, (fw, fh), cv2.CV_32FC1)
+    print("Undistortion maps created.")
+    print("Using Intrinsics for PnP:\n", new_K)
 
-        if frame_count == 0:
-            h, w = frame.shape[:2]
-            new_K, roi = cv2.getOptimalNewCameraMatrix(K, dist, (w,h),1,(w,h))
-            print("Optimal K:\n", new_K)
+    # --- State Variables ---
+    prev_gray = None
+    prev_kp = None
+    prev_des = None
+    prev_depth_map = None # <<< Added for PnP VO
+    traj_hist = deque(maxlen=200)
+    origin_px = (fw // 2, fh - fh // 10)
+    current_pos_px = origin_px
+    traj_hist.append(current_pos_px)
+    cumulative_R = np.eye(3, dtype=np.float32) # Use float32 for consistency
+    cumulative_t = np.zeros((3, 1), dtype=np.float32)
+    # === VO Tuning Parameters ===
+    vis_odom_scale = 40.0 # Scale factor for VISUALIZING trajectory from VO translation
+    depth_pnp_scale = 5.0 # ** CRUCIAL **: Heuristic scale for PnP depth (maps normalized closeness -> metric Z)
+    # This depth_pnp_scale needs tuning based on typical scene depth & MiDaS output range.
+    # A larger value means normalized depth differences map to larger metric Z differences.
+    # ==========================
 
-        undist = cv2.undistort(frame, K, dist, None, new_K)
-        rgb = cv2.cvtColor(undist, cv2.COLOR_BGR2RGB)
-        gray = cv2.cvtColor(undist, cv2.COLOR_BGR2GRAY)
+    num_workers = 3
+    executor = ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix='Worker')
+    print(f"Thread pool started with {num_workers} workers.")
 
-        depth_map = run_depth_estimation(MIDAS, TRANSFORM, rgb, device)
-        objects, _ = run_object_detection(YOLO, undist)
-        objects = update_object_depth(objects, depth_map)
+    # --- Main Loop ---
+    frame_count = 0; last_instruction_time = time.time(); instruction_speak_delay = 3.5; fps = 0.0
+    print("Starting main loop... Press 'q' to quit.")
+    speak("Navigation system ready.")
 
-        kp, des, R, t, m1, m2 = process_visual_odometry(prev_gray, gray, prev_kp, prev_des, new_K)
-        if R is not None and t is not None:
-            cum_t += cum_R @ (scale * t)
-            cum_R = cum_R @ R
-            vis_x = int(origin[0] + cum_t[0,0])
-            vis_y = int(origin[1] - cum_t[2,0])
-            vis_x = np.clip(vis_x, 0, fw-1)
-            vis_y = np.clip(vis_y, 0, fh-1)
-            curr_vis = (vis_x, vis_y)
-            traj_hist.append(curr_vis)
+    try:
+        while True:
+            loop_start_time = time.time()
 
-        waypoints, obs_map, cost_vis = plan_trajectory(objects, curr_vis, depth_map, undist.shape)
-        instructions = generate_instructions(waypoints)
-        print(instructions)
-        if tts_engine and instructions and instructions[0] != "No path computed":
-            to_say = instructions[0]  # Say the first instruction
-            tts_engine.say(to_say)
-            tts_engine.runAndWait()
+            # 1. Read Frame
+            try:
+                ret, frame = cap.read();
+                if not ret: print("End of stream. Exiting."); speak("Camera feed stopped."); break
+            except Exception as e: print(f"Error reading frame: {e}"); speak("Camera error."); break
 
-        combined = visualize_combined(undist, objects, m1, m2, instructions)
-        traj_view = visualize_trajectory(undist.shape, traj_hist, curr_vis, waypoints, obs_map, cost_vis)
+            # 2. Preprocessing
+            try:
+                undistorted_frame = cv2.remap(frame, mapx, mapy, cv2.INTER_LINEAR)
+                rgb_frame_copy = cv2.cvtColor(undistorted_frame, cv2.COLOR_BGR2RGB)
+                gray_frame = cv2.cvtColor(undistorted_frame, cv2.COLOR_BGR2GRAY)
+            except cv2.error as e: print(f"OpenCV error during preprocessing: {e}"); continue
 
-        cv2.imshow('YOLO + VO View', combined)
-        cv2.imshow('Trajectory Planning View', traj_view)
+            # 3. Submit Tasks (Pass PREVIOUS depth map to VO)
+            try:
+                future_depth = executor.submit(run_depth_estimation, midas_model, midas_transform, rgb_frame_copy, device, stream_depth)
+                future_objects = executor.submit(run_object_detection, yolo_model, undistorted_frame, device, stream_objdet)
+                # <<< Pass previous depth map to PnP VO function >>>
+                future_vo = executor.submit(process_visual_odometry_pnp,
+                                            prev_gray, gray_frame, prev_kp, prev_des,
+                                            prev_depth_map, # Pass previous depth map
+                                            new_K, # Use undistorted intrinsics
+                                            None, # Distortion handled by remap
+                                            depth_vo_scale=depth_pnp_scale) # Pass PnP scale
+            except Exception as e: print(f"Error submitting tasks: {e}"); continue
 
-        prev_gray = gray.copy()
-        prev_kp, prev_des = kp, des
-        frame_count += 1
+            # 4. Retrieve Results
+            try:
+                depth_map_closeness = future_depth.result() # Current depth map
+                objects, _ = future_objects.result()
+                kp, des, R_vo, t_vo, vo_pts1, vo_pts2 = future_vo.result()
+            except Exception as e:
+                print(f"Error retrieving results: {e}")
+                depth_map_closeness = np.zeros_like(gray_frame, dtype=np.float32) if prev_depth_map is None else prev_depth_map
+                objects = []; kp, des = prev_kp, prev_des; R_vo, t_vo, vo_pts1, vo_pts2 = None, None, None, None
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            # 5. Process Results
+            try:
+                objects = update_object_depth(objects, depth_map_closeness)
 
-    cap.release()
-    cv2.destroyAllWindows()
-    print("Exiting and cleaned up.")
+                # Update Visual Odometry Pose
+                if R_vo is not None and t_vo is not None:
+                     # Ensure float32 for matrix operations
+                    R_vo = R_vo.astype(np.float32)
+                    t_vo = t_vo.astype(np.float32)
+
+                    # Accumulate Pose: T_world_curr = T_prev_curr * T_world_prev
+                    # Translation update needs rotation by cumulative R
+                    # t_update_world = cumulative_R @ t_vo # t_vo is translation in prev frame coords
+                    # cumulative_t += t_update_world
+                    cumulative_t = cumulative_t + cumulative_R @ t_vo # Compact form
+                    # Rotation update: R_world_curr = R_prev_curr * R_world_prev
+                    cumulative_R = R_vo @ cumulative_R # R_vo is rotation from prev to curr
+
+                    # Update visualization position using the VISUAL ODOMETRY scale
+                    vis_x = int(origin_px[0] + cumulative_t[0, 0] * (vis_odom_scale / depth_pnp_scale)) # Adjust viz scale relative to PnP scale
+                    vis_y = int(origin_px[1] - cumulative_t[2, 0] * (vis_odom_scale / depth_pnp_scale)) # Map Z change to screen Y change
+                    vis_x = np.clip(vis_x, 0, fw - 1); vis_y = np.clip(vis_y, 0, fh - 1)
+                    if np.linalg.norm(np.array(current_pos_px) - np.array((vis_x, vis_y))) > 1: # Sensitivity reduced
+                        current_pos_px = (vis_x, vis_y); traj_hist.append(current_pos_px)
+
+
+                # Plan trajectory
+                waypoints, obstacle_map_vis, cost_map_vis_color = plan_trajectory(objects, current_pos_px, depth_map_closeness, undistorted_frame.shape)
+                instructions = generate_instructions(waypoints)
+
+            except Exception as e:
+                print(f"Error during post-processing: {e}")
+                instructions = ["Processing Error"]
+                waypoints, obstacle_map_vis, cost_map_vis_color = [current_pos_px], np.zeros_like(gray_frame, dtype=np.uint8), np.zeros((fh, fw, 3), dtype=np.uint8)
+
+            # 6. Speak Alerts / Instructions
+            try:
+                very_close_obstacle = False; obstacle_warning_threshold = 0.85; close_obstacle_label = ""
+                for obj in objects:
+                    if obj.get('closeness', 0.0) > obstacle_warning_threshold:
+                        very_close_obstacle = True; close_obstacle_label = obj.get('label', 'Obstacle')
+                        speak(f"Warning! {close_obstacle_label} very close ahead!")
+                        instructions = [f"STOP! {close_obstacle_label} detected!"]; last_instruction_time = time.time(); break
+                current_time = time.time()
+                if not very_close_obstacle and instructions and instructions[0] != "No path computed" and (current_time - last_instruction_time > instruction_speak_delay):
+                     if instructions[0] not in ["Processing Error", "STOP! Obstacle detected!"]:
+                          speak(instructions[0]); last_instruction_time = current_time
+            except Exception as e: print(f"Error during alert/TTS processing: {e}")
+
+            # 7. Visualization
+            loop_end_time = time.time(); elapsed_time = loop_end_time - loop_start_time
+            fps = 0.9 * fps + 0.1 * (1.0 / elapsed_time if elapsed_time > 0 else 0)
+            try:
+                combined_view = visualize_combined(undistorted_frame, objects, vo_pts1, vo_pts2, instructions, fps)
+                trajectory_view = visualize_trajectory(undistorted_frame.shape, traj_hist, current_pos_px, waypoints, obstacle_map_vis, cost_map_vis_color)
+                cv2.imshow('Object Detection + PnP VO View', combined_view) # Window title updated
+                cv2.imshow('Trajectory Planning View', trajectory_view)
+            except cv2.error as e: print(f"OpenCV error during visualization: {e}")
+            except Exception as e: print(f"General error during visualization: {e}")
+
+            # --- Update State for Next Loop ---
+            prev_gray = gray_frame # No copy needed if gray_frame isn't modified elsewhere before next loop
+            prev_kp = kp
+            prev_des = des
+            prev_depth_map = depth_map_closeness.copy() # <<< MUST copy the depth map for use in the next frame's VO
+
+            frame_count += 1
+
+            # 8. Exit Condition
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'): print("'q' pressed, initiating shutdown."); speak("Exiting program."); break
+            elif key == ord('s'): speak(f"Status OK. Position {current_pos_px}. FPS {fps:.1f}.")
+
+    except KeyboardInterrupt: print("\nCtrl+C detected. Initiating graceful shutdown."); speak("Shutdown initiated.")
+    finally:
+        print("Cleaning up resources...")
+
+        # 1. Signal threads to stop and shutdown executor
+        if 'executor' in locals() and executor is not None:
+            print("Shutting down thread pool...")
+            try:
+                executor.shutdown(wait=False, cancel_futures=True) # Don't wait, try to cancel running
+                print("Thread pool shutdown signal sent.")
+            except Exception as e:
+                print(f"Error shutting down thread pool: {e}")
+
+        # 2. Stop TTS thread
+        print("Stopping TTS worker...")
+        tts_stop_event.set()
+        if 'tts_thread' in locals() and tts_thread.is_alive():
+            try:
+                 tts_queue.put(None) # Send sentinel
+                 tts_thread.join(timeout=3.0) # Wait for thread to finish
+                 if tts_thread.is_alive():
+                      print("Warning: TTS thread did not terminate gracefully.")
+                 else:
+                      print("TTS worker stopped.")
+            except Exception as e:
+                 print(f"Error stopping TTS thread: {e}")
+
+        # 3. Release Camera
+        if 'cap' in locals() and cap is not None and cap.isOpened():
+            print("Releasing camera...")
+            try:
+                cap.release()
+                print("Camera released.")
+            except Exception as e:
+                print(f"Error releasing camera: {e}")
+
+        # 4. Destroy OpenCV Windows
+        print("Destroying OpenCV windows...")
+        try:
+            cv2.destroyAllWindows()
+            # Add a small wait for windows to actually close on some systems
+            # cv2.waitKey(50)
+            print("OpenCV windows destroyed.")
+        except Exception as e:
+            print(f"Error destroying OpenCV windows: {e}")
+
+        print("Cleanup finished. Exiting.")
+        # Explicit exit call might be needed if daemon threads delay exit
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
