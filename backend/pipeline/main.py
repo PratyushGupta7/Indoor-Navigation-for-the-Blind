@@ -9,12 +9,12 @@ import threading
 import queue
 import time
 from concurrent.futures import ThreadPoolExecutor
-import sys
+import sys 
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-#  TTS Setup 
+# --- TTS Setup ---
 tts_queue = queue.Queue()
 tts_stop_event = threading.Event()
 
@@ -35,7 +35,7 @@ def tts_worker():
                 if text_to_say is None:
                     print("TTS Worker received stop signal.")
                     break
-                print(f"TTS Saying: '{text_to_say}'")
+                print(f"TTS Saying: '{text_to_say}'") 
                 engine.say(text_to_say)
                 engine.runAndWait()
                 tts_queue.task_done()
@@ -46,14 +46,14 @@ def tts_worker():
                 if not tts_queue.empty():
                     try: tts_queue.get_nowait()
                     except queue.Empty: pass
-                tts_queue.task_done() # Still need to call task_done
+                tts_queue.task_done() 
 
     except Exception as engine_init_error:
          print(f"FATAL: Failed to initialize TTS engine: {engine_init_error}")
     finally:
         print("TTS Worker shutting down.")
         if engine:
-             try: pass # pyttsx3 usually handles cleanup
+             try: pass 
              except Exception as e: print(f"Error during TTS engine cleanup: {e}")
         print("TTS Worker finished.")
 
@@ -95,7 +95,6 @@ def load_calibration(filepath_matrix='camera_matrix.npy', filepath_coeffs='disto
         k = np.load(filepath_matrix)
         dist_coeffs = np.load(filepath_coeffs)
         print("Camera calibration files loaded successfully.")
-        # Ensure float32 type, important for OpenCV functions like PnP
         return k.astype(np.float32), dist_coeffs.astype(np.float32)
     except FileNotFoundError:
         print("Warning: Camera calibration files not found.")
@@ -616,8 +615,8 @@ def main():
         print(f"FATAL: Error initializing camera: {e}")
         speak("Error initializing camera.")
         tts_stop_event.set()
-        if tts_thread.is_alive(): 
-            try: 
+        if tts_thread.is_alive():
+            try:
                 tts_queue.put(None); tts_thread.join(timeout=2)
             except Exception as te: print(f"Error stopping TTS thread: {te}")
         if cap is not None: cap.release(); cv2.destroyAllWindows(); sys.exit(1)
@@ -708,16 +707,14 @@ def main():
                     t_vo = t_vo.astype(np.float32)
 
                     # Accumulate Pose: T_world_curr = T_prev_curr * T_world_prev
-                    # Translation update needs rotation by cumulative R
-                    # t_update_world = cumulative_R @ t_vo # t_vo is translation in prev frame coords
-                    # cumulative_t += t_update_world
                     cumulative_t = cumulative_t + cumulative_R @ t_vo # Compact form
-                    # Rotation update: R_world_curr = R_prev_curr * R_world_prev
                     cumulative_R = R_vo @ cumulative_R # R_vo is rotation from prev to curr
 
                     # Update visualization position using the VISUAL ODOMETRY scale
-                    vis_x = int(origin_px[0] + cumulative_t[0, 0] * (vis_odom_scale / depth_pnp_scale)) # Adjust viz scale relative to PnP scale
-                    vis_y = int(origin_px[1] - cumulative_t[2, 0] * (vis_odom_scale / depth_pnp_scale)) # Map Z change to screen Y change
+                    # Adjust viz scale relative to PnP scale - may still need tuning
+                    viz_scale_factor = (vis_odom_scale / depth_pnp_scale) if depth_pnp_scale != 0 else 1.0
+                    vis_x = int(origin_px[0] + cumulative_t[0, 0] * viz_scale_factor)
+                    vis_y = int(origin_px[1] - cumulative_t[2, 0] * viz_scale_factor) # Map Z change to screen Y change
                     vis_x = np.clip(vis_x, 0, fw - 1); vis_y = np.clip(vis_y, 0, fh - 1)
                     if np.linalg.norm(np.array(current_pos_px) - np.array((vis_x, vis_y))) > 1: # Sensitivity reduced
                         current_pos_px = (vis_x, vis_y); traj_hist.append(current_pos_px)
@@ -734,13 +731,19 @@ def main():
 
             # 6. Speak Alerts / Instructions
             try:
-                very_close_obstacle = False; obstacle_warning_threshold = 0.85; close_obstacle_label = ""
+                very_close_obstacle = False; obstacle_warning_threshold = 0.85
                 for obj in objects:
                     if obj.get('closeness', 0.0) > obstacle_warning_threshold:
-                        very_close_obstacle = True; close_obstacle_label = obj.get('label', 'Obstacle')
-                        speak(f"Warning! {close_obstacle_label} very close ahead!")
-                        instructions = [f"STOP! {close_obstacle_label} detected!"]; last_instruction_time = time.time(); break
+                        very_close_obstacle = True
+                        # --- MODIFICATION HERE ---
+                        # Speak generic warning instead of specific object label
+                        speak("Warning! Object very close ahead!")
+                        instructions = ["STOP! Obstacle detected!"] # Keep instruction generic too
+                        # -------------------------
+                        last_instruction_time = time.time(); break # Reset timer and exit loop
+
                 current_time = time.time()
+                # Speak navigation instructions periodically if no immediate danger
                 if not very_close_obstacle and instructions and instructions[0] != "No path computed" and (current_time - last_instruction_time > instruction_speak_delay):
                      if instructions[0] not in ["Processing Error", "STOP! Obstacle detected!"]:
                           speak(instructions[0]); last_instruction_time = current_time
@@ -772,6 +775,7 @@ def main():
 
     except KeyboardInterrupt: print("\nCtrl+C detected. Initiating graceful shutdown."); speak("Shutdown initiated.")
     finally:
+        # --- Cleanup ---
         print("Cleaning up resources...")
 
         # 1. Signal threads to stop and shutdown executor
