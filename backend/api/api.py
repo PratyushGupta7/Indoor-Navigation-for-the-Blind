@@ -5,7 +5,7 @@ from pydantic import BaseModel
 import uvicorn
 import cv2
 import numpy as np
-from backend.pipeline.main import *
+from backend.pipeline.setup import *
 
 app = FastAPI()
 
