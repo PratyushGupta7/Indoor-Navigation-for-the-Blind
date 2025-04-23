@@ -1,4 +1,5 @@
 # uvicorn backend.api.api:app --host 0.0.0.0 --port 8000 --reload
+# ngrok http 8000
 
 from fastapi import FastAPI, File, UploadFile
 from pydantic import BaseModel
@@ -22,10 +23,10 @@ async def predict(file: UploadFile = File(...)):
     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     # 1) depth
-    depth = run_depth_estimation(MIDAS, TRANSFORM, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), device)
+    depth = run_depth_estimation(MIDAS, TRANSFORM, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), device, None)
 
     # 2) objects
-    objects, _ = run_object_detection(YOLO, frame)
+    objects, _ = run_object_detection(YOLO, frame, device, None)
     objects = update_object_depth(objects, depth)
 
     # 3) vo & pose‑tracking state would normally be stored per‑session; 
