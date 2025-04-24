@@ -8,7 +8,7 @@ export async function POST(request: Request) {
 
     // Forward to external prediction endpoint
     const externalRes = await fetch(
-      'https://9ebf-103-55-60-225.ngrok-free.app/predict',
+      'http://192.168.45.162:8000/predict',
       {
         method: 'POST',
         body: formData,
