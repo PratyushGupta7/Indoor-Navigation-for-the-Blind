@@ -2,6 +2,7 @@
 # ngrok http 8000
 
 from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 import cv2
@@ -9,6 +10,14 @@ import numpy as np
 from backend.pipeline.setup import *
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class DetectionResponse(BaseModel):
     objects: list
