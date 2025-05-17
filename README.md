@@ -1,5 +1,5 @@
 # Indoor Navigation for the Blind 🧭🦯  
-[![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/PratyushGupta7/Indoor-Navigation-for-the-Blind/blob/main/LICENSE) 
+[![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/PratyushGupta7/Indoor-Navigation-for-the-Blind/blob/main/LICENSE.md) 
 [![GitHub issues](https://img.shields.io/github/issues/PratyushGupta7/Indoor-Navigation-for-the-Blind)](https://github.com/PratyushGupta7/Indoor-Navigation-for-the-Blind/issues) 
 [![GitHub stars](https://img.shields.io/github/stars/PratyushGupta7/Indoor-Navigation-for-the-Blind)](https://github.com/PratyushGupta7/Indoor-Navigation-for-the-Blind/stargazers)
 
@@ -203,4 +203,4 @@ This work builds upon a rich history of research in computer vision, robotics, a
 
 ## 📜 License
 
-This project is licensed under the [MIT License](https://github.com/PratyushGupta7/Indoor-Navigation-for-the-Blind/blob/main/LICENSE).
+This project is licensed under the [MIT License](https://github.com/PratyushGupta7/Indoor-Navigation-for-the-Blind/blob/main/LICENSE.md).
